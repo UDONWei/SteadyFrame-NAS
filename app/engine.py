@@ -124,6 +124,49 @@ def matrix(p):
     c, s = np.cos(angle), np.sin(angle)
     return np.array([[c, -s, x], [s, c, y], [0, 0, 1]], dtype=np.float64)
 
+def crop_zoom(warps, width, height):
+    """Minimum fixed centered zoom whose inverse output corners stay in source pixels."""
+    center=np.array([(width-1)/2,(height-1)/2])
+    inverse=np.linalg.inv(warps)
+    anchor=np.einsum('nij,j->ni',inverse[:,:2,:2],center)+inverse[:,:2,2]
+    low=np.array([1.,1.]);high=np.array([width-2.,height-2.])
+    if np.any(anchor<=low) or np.any(anchor>=high): return float('inf')
+    corners=np.array([[0,0],[width-1,0],[width-1,height-1],[0,height-1]])
+    offsets=np.einsum('nij,kj->nki',inverse[:,:2,:2],corners-center)
+    room=np.where(offsets>=0,high-anchor[:,None,:],anchor[:,None,:]-low)
+    return max(1.,float(np.max(np.abs(offsets)/room)))*(1+1e-7)
+
+
+def plan_crop(poses, desired, size, dimensions, options, cancelled=lambda:False):
+    width,height=dimensions
+    coordinates=np.diag([width/size[0],height/size[1],1.])
+    inv_coordinates=np.linalg.inv(coordinates)
+    relative=np.array([matrix(t)@np.linalg.inv(matrix(p)) for p,t in zip(poses,desired)])
+    angles=np.arctan2(relative[:,1,0],relative[:,0,0])
+    def transforms(strength):
+        result=np.repeat(np.eye(3)[None],len(relative),axis=0)
+        c=np.cos(angles*strength);s=np.sin(angles*strength)
+        result[:,0,0]=c;result[:,1,1]=c;result[:,0,1]=-s;result[:,1,0]=s
+        result[:,:2,2]=relative[:,:2,2]*strength
+        return coordinates@result@inv_coordinates
+    warps=transforms(1.)
+    requested=options['zoom'];strength=1.
+    if not options.get('auto_crop',True): return warps,requested,strength
+    limit=max(requested,options.get('max_auto_zoom',2.))
+    needed=crop_zoom(warps,width,height)
+    if needed>limit:
+        low,high=0.,1.
+        if crop_zoom(transforms(0.),width,height)>limit:
+            raise ValueError('自动裁切上限太低，请略微提高上限以留出插值安全边距')
+        for _ in range(28):
+            if cancelled(): raise InterruptedError('任务已取消')
+            mid=(low+high)/2
+            if crop_zoom(transforms(mid),width,height)<=limit: low=mid
+            else: high=mid
+        strength=low;warps=transforms(strength);needed=crop_zoom(warps,width,height)
+    return warps,max(requested,needed),strength
+
+
 def subject_step(previous, current, box):
     """Subpixel displacement, rejecting background and inconsistent optical flow."""
     x,y,w,h=map(int,box); mask=np.zeros_like(previous)
@@ -236,6 +279,9 @@ def stabilize(source, normalized, output, options, report, cancelled):
     if any(p is None for p in poses): raise ValueError('剪辑范围超出可解码的视频帧')
     poses=np.asarray(poses); poses[:,2]=np.unwrap(poses[:,2])
     desired=np.zeros_like(poses) if mode in ('lock','subject') else smooth(poses,options['smoothing'])
+    check()
+    warps,zoom,strength=plan_crop(poses,desired,size,(w,h),options,cancelled)
+    report(f'裁切 {zoom:.3f}×，保留防抖修正 {strength:.0%}',45)
     height=options['resolution']
     ow,oh=(w//2*2,h//2*2) if height==0 else (max(2,round(w/h*height/2)*2),height)
     codec=options['codec']; fmt=options['format']
@@ -249,16 +295,15 @@ def stabilize(source, normalized, output, options, report, cancelled):
          '-c:a','libopus' if fmt=='webm' else 'aac','-af','apad','-t',f'{len(poses)/fps:.12g}']
     if fmt in ('mp4','mov'): cmd+=['-movflags','+faststart']
     cap=SourceFrames(source,meta,(w,h),cancelled,clip_start,count)
-    coordinates=np.diag([w/size[0],h/size[1],1.])
+    center_x,center_y=(w-1)/2,(h-1)/2
+    z=np.array([[zoom,0,(1-zoom)*center_x],[0,zoom,(1-zoom)*center_y],[0,0,1]])
     try:
         with open(output.parent/'encode.log','wb') as log:
             p=subprocess.Popen([*cmd,str(temp)],stdin=subprocess.PIPE,stderr=log)
             try:
-                for i,(pose,target) in enumerate(zip(poses,desired)):
+                for i,warp in enumerate(warps):
                     check(); ok,frame=cap.read()
                     if not ok: raise ValueError('第二遍解码提前结束')
-                    warp=coordinates@matrix(target)@np.linalg.inv(matrix(pose))@np.linalg.inv(coordinates)
-                    zoom=options['zoom']; z=np.array([[zoom,0,(1-zoom)*w/2],[0,zoom,(1-zoom)*h/2],[0,0,1]])
                     stabilized=cv2.warpAffine(frame,(z@warp)[:2],(w,h),borderMode=cv2.BORDER_CONSTANT)
                     p.stdin.write(cv2.resize(stabilized,(ow,oh)).tobytes())
                     if i%20==0: report('编码导出',45+54*i/len(poses))
@@ -268,4 +313,4 @@ def stabilize(source, normalized, output, options, report, cancelled):
                 if p.poll() is None: p.kill(); p.wait()
     finally: cap.release()
     check(); temp.replace(output)
-    return dict(**meta,output_width=ow,output_height=oh)
+    return dict(**meta,output_width=ow,output_height=oh,effective_zoom=zoom,stabilization_strength=strength,auto_crop=options.get('auto_crop',True),retained_area=1/zoom**2)

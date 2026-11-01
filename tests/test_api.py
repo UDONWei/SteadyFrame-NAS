@@ -73,6 +73,19 @@ def test_job_lifecycle(client,monkeypatch):
     assert client.get(f"/api/jobs/{job['id']}/{first_name}").content==first
     status=next(f for f in client.get('/api/files').json() if f['name']=='demo.avi')
     assert status['outputs']==2 and status['preview']
+    endpoint=f"/api/jobs/{job['id']}/delete-output"
+    assert client.post(endpoint,json={'file':first_name}).status_code==400
+    assert client.post(endpoint,json={'file':'../first.jpg','confirmed':True}).status_code==404
+    assert client.post(endpoint,json={'file':first_name,'confirmed':True}).status_code==200
+    assert not exported.exists() and second.is_file()
+    remaining=next(j for j in client.get('/api/jobs').json() if j['id']==job['id'])
+    assert len(remaining['results'])==1
+    assert (server.DATA/job['id']/'preview.mp4').is_file()
+    assert client.get(f"/api/jobs/{job['id']}/{first_name}").status_code==404
+    assert client.post(endpoint,json={'file':done['result'],'confirmed':True}).status_code==200
+    empty=next(j for j in client.get('/api/jobs').json() if j['id']==job['id'])
+    assert empty['results']==[] and empty['state']=='ready'
+    assert (server.DATA/job['id']/'preview.mp4').is_file()
     assert client.post(f"/api/jobs/{job['id']}/delete",json={}).status_code==400
     assert client.post(f"/api/jobs/{job['id']}/delete",json={'confirmed':True}).status_code==200
     assert path.is_file() and not (server.DATA/job['id']).exists()

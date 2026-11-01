@@ -59,7 +59,9 @@ class Options(BaseModel):
     export_directory: str=Field('',max_length=2048)
     mode: Literal['translation','smooth','lock','subject']='smooth'
     smoothing: int=Field(30,ge=1,le=150)
-    zoom: float=Field(1.1,ge=1,le=2)
+    zoom: float=Field(1.1,ge=1,le=4)
+    auto_crop: bool=True
+    max_auto_zoom: float=Field(2,ge=1.01,le=4)
     resolution: Literal[0,480,720,1080,1440,2160]=0
     format: Literal['mp4','mov','mkv','webm']='mp4'
     codec: Literal['h264','hevc','vp9']='h264'
@@ -163,7 +165,7 @@ def render_worker(id,options):
     except Exception as e: update(id,state='cancelled' if events[id].is_set() else 'failed',message=str(e))
 
 @app.get('/api/health')
-def health(): return {'status':'ok','version':'0.4.0'}
+def health(): return {'status':'ok','version':'0.5.0'}
 
 @app.get('/api/export-settings')
 def export_settings():
@@ -273,6 +275,29 @@ def cancel(id: str):
 
 class DeleteRequest(BaseModel):
     confirmed: bool=False
+
+class DeleteOutput(BaseModel):
+    file: str
+    confirmed: bool=False
+
+@app.post('/api/jobs/{id}/delete-output')
+def delete_output(id: str, body: DeleteOutput):
+    if not body.confirmed: raise HTTPException(400,'请确认删除所选输出视频')
+    with lock:
+        j=getjob(id)
+        if j['state'] in ACTIVE: raise HTTPException(409,'请等待当前任务结束后删除输出')
+        versions=results(j)
+        selected=next((r for r in versions if r['file']==body.file),None)
+        if selected is None: raise HTTPException(404,'输出不存在')
+        target=export_file(selected) if selected.get('export_relative') else DATA/id/selected['file']
+        if not selected.get('export_relative') and target.resolve().parent!=(DATA/id).resolve(): raise HTTPException(400,'无效输出路径')
+        target.unlink(missing_ok=True)
+        remaining=[r for r in versions if r['file']!=body.file]
+        update(id,results=remaining,result=remaining[-1]['file'] if remaining else None,
+               output=remaining[-1].get('output') if remaining else None,
+               state='done' if remaining else 'ready',progress=100 if remaining else 0,
+               message='已删除所选输出，预览缓存保留')
+    return {'deleted':True}
 
 @app.post('/api/jobs/{id}/delete')
 def delete_job(id: str, body: DeleteRequest):

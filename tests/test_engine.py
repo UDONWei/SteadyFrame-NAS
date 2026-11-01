@@ -79,3 +79,31 @@ def test_backward_chunks_cover_each_frame(monkeypatch):
     assert [i for i,f,r in frames]==list(range(100,120))+list(range(100,-1,-1))
     assert all(i==f for i,f,r in frames)
     assert sum(r for i,f,r in frames)==2
+
+
+@pytest.mark.parametrize('offset,angle,limit',[(18,.08,2),(240,.35,1.3),(0,0,2),(-170,-.5,1.5)])
+def test_auto_crop_prevents_new_border_pixels(offset,angle,limit):
+    poses=np.array([[0,0,0],[offset,20,angle],[-offset,-10,-angle]])
+    desired=np.zeros_like(poses)
+    transforms,zoom,strength=engine.plan_crop(poses,desired,(320,180),(320,180),
+        dict(zoom=1,auto_crop=True,max_auto_zoom=limit))
+    assert 1<=zoom<=limit+1e-8 and 0<=strength<=1
+    if abs(offset)>150:assert strength<1
+    center=np.array([159.5,89.5])
+    z=np.array([[zoom,0,(1-zoom)*center[0]],[0,zoom,(1-zoom)*center[1]],[0,0,1]])
+    source=np.full((180,320,3),255,np.uint8)
+    for transform in transforms:
+        image=cv2.warpAffine(source,(z@transform)[:2],(320,180),borderMode=cv2.BORDER_CONSTANT)
+        assert image.min()==255
+
+
+def test_manual_zoom_and_auto_metadata(clip,tmp_path):
+    poses=np.array([[0.,0,0],[25,0,0]])
+    transforms,zoom,strength=engine.plan_crop(poses,np.zeros_like(poses),(320,180),(320,180),
+        dict(zoom=1.25,auto_crop=False))
+    assert zoom==1.25 and strength==1
+    source,proxy=clip
+    meta=engine.stabilize(source,proxy,tmp_path/'auto.mp4',dict(mode='translation',format='mp4',codec='h264',
+        resolution=0,smoothing=8,zoom=1,auto_crop=True,max_auto_zoom=2),lambda *a:None,lambda:False)
+    assert 1<meta['effective_zoom']<=2 and meta['auto_crop']
+    assert meta['retained_area']==pytest.approx(1/meta['effective_zoom']**2)
