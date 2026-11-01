@@ -1,2 +1,58 @@
-# SteadyFrame-NAS
-CPU-first Docker video stabilization for NAS, with subject tracking and flexible exports.
+# SteadyFrame NAS
+
+面向绿联 DXP4800 Plus / 16GB / Linux amd64 Docker 的视频防抖应用。CPU 优先，单工作任务、2 CPU、6 GiB 容器上限。英文名意为“稳定画面”；未作商标注册判断。
+
+## 功能
+
+- 在网页逐级浏览只读 NAS 视频目录；FFmpeg 解码常见 MP4、MOV、MKV、AVI、MTS/M2TS、WebM 等。扩展名可见不代表所有编码都可解码，失败时显示原因。
+- 平移防抖、平移加旋转平滑、固定机位锁定首帧、首帧点选/框选主体 CSRT 跟踪锁定。
+- MP4 / MOV / MKV + H.264 或 HEVC，WebM + VP9；原分辨率、480p、720p、1080p、1440p、2160p，保持比例并输出偶数尺寸。
+- 保留首条音轨并重编码 AAC / Opus；任务状态持久化、下载、取消。重启后中断任务不会自动重跑。
+- 原视频只读，派生预览及成片只写 data。运行不调用任何外部视频服务。
+
+## NAS 部署
+
+首次构建需要能访问 Debian 和 PyPI。当前不包含预构建镜像或离线依赖包；Docker/NAS 部署必须在实际设备验收。
+
+1. 将源码放在独立目录，例如 `/volume1/docker/steadyframe-nas`。不要放在视频树中，不覆盖 PlumiVault。
+2. 复制 `.env.example` 为 `.env`，把 `VIDEO_DIR` 改成已有视频目录的绝对路径，填实际 `id -u` / `id -g`。示例沿用既有 NAS UID 1000 / GID 10，需核对。
+3. 在 NAS 项目目录执行：
+
+```sh
+mkdir -p data
+docker compose config
+docker compose up -d --build
+docker compose ps
+```
+
+如果 Docker 需要 sudo，仅给 docker 命令加 sudo。确保 data 对指定 UID/GID 可写。
+
+默认只发布 NAS 回环端口，应用本身没有账户认证。使用现有 SSH 连接建立隧道后，在电脑浏览器打开 `http://127.0.0.1:8786`：
+
+```sh
+ssh -N -L 8786:127.0.0.1:8786 YOUR_USER@YOUR_NAS
+```
+
+日常多设备访问可由既有 HTTPS + 身份验证网关反向代理 NAS 的 127.0.0.1:8786；不要直接将未认证端口暴露到公网。独立端口不改变鸟类应用。
+
+## 使用
+
+选择视频后先生成 CFR、正方向、方像素 H.264 预览。准备完成后，在首帧点选主体（默认 16% 选框）或拖动精确框选；在下方播放预览核对。选择防抖方式、格式、分辨率和放大倍率后开始导出。任务完成点击“下载结果”。
+
+平滑半径越大，运镜越平稳、边缘裁切需求越高。固定机位适合本应静止的镜头；主体锁定把目标保持在首帧位置，背景会移动。放大 1.1 为起点，强烈运动仍可能产生黑边。主体被遮挡或离开画面可能跟丢或漂移；明确失败会停止，成功结果仍需人工复核。
+
+## 当前边界
+
+输出为 8-bit SDR，不保留 HDR、10-bit、字幕、多音轨和所有源元数据；VFR 输入经 CFR 预览标准化。HDR 尚未实现色调映射，请先使用 SDR 素材。暂不提供陀螺仪、滚动快门校正、透视稳定、自动剪辑切镜和 AI 重新识别主体。长视频需要完整预览磁盘空间；轨迹内存随帧数增长，帧图像按帧处理。当前缓存不自动清理，需停服务后按任务目录手工归档，勿在处理中删除文件。取消预览转码在当前转码步骤结束后生效，防抖阶段逐帧响应。
+
+## 开发与验证
+
+```sh
+python -m pip install -r requirements.txt
+python -m pip install pytest==8.3.5 httpx==0.28.1
+python -m pytest -q
+```
+
+测试需系统 ffmpeg，可通过 FFMPEG 环境变量指定可执行文件。参见 STATUS.md。开发云端只放源码和合成测试，不上传私人视频、NAS 密钥、数据库或 .env。
+
+算法参考：[OpenCV tracking](https://docs.opencv.org/4.x/dc/d6b/group__video__track.html)、[FFmpeg](https://ffmpeg.org/documentation.html)。依赖许可独立于本项目；分发镜像前需审核 FFmpeg 构建与编码许可。

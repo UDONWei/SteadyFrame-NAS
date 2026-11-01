@@ -1,0 +1,26 @@
+services:
+  steadyframe:
+    build: .
+    image: steadyframe-nas:0.1.0
+    platform: linux/amd64
+    user: "${PUID:-1000}:${PGID:-10}"
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8786:8786"
+    volumes:
+      - "${VIDEO_DIR:?Set VIDEO_DIR in .env}:/media:ro"
+      - "./data:/data"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 6g
+    cpus: 2
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8786/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
