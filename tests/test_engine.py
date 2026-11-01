@@ -93,7 +93,7 @@ def test_auto_crop_prevents_new_border_pixels(offset,angle,limit):
     z=np.array([[zoom,0,(1-zoom)*center[0]],[0,zoom,(1-zoom)*center[1]],[0,0,1]])
     source=np.full((180,320,3),255,np.uint8)
     for transform in transforms:
-        image=cv2.warpAffine(source,(z@transform)[:2],(320,180),borderMode=cv2.BORDER_CONSTANT)
+        image=engine.render_frame(source,z@transform,(320,180))
         assert image.min()==255
 
 
@@ -127,3 +127,18 @@ def test_subject_stops_after_persistent_unreliable_motion(clip,tmp_path,monkeypa
         engine.stabilize(source,proxy,tmp_path/'bad.mp4',dict(mode='subject',roi=(.2,.2,.6,.6),
             smoothing=30,format='mp4',codec='h264',resolution=0,zoom=1.1),lambda *a:None,lambda:False)
     assert not (tmp_path/'bad.mp4').exists()
+
+
+def test_high_quality_downscale_reduces_texture_crawling():
+    width,height=960,540;y,x=np.mgrid[:height,:width]
+    old,new=[],[]
+    for shift in np.linspace(0,1,12):
+        plane=127+50*np.sin(2*np.pi*(x-shift)*.32)+45*np.cos(2*np.pi*(y-shift*.3)*.27)
+        frame=np.clip(plane,0,255).astype(np.uint8)
+        transform=np.array([[1.,0,-shift],[0,1.,-shift*.3],[0,0,1.]])
+        legacy=cv2.warpAffine(frame,transform[:2],(width,height))
+        legacy=cv2.resize(legacy,(320,180))
+        improved=engine.render_frame(frame,transform,(320,180))
+        old.append(legacy[10:-10,10:-10].astype(float))
+        new.append(improved[10:-10,10:-10].astype(float))
+    assert np.mean(np.std(new,axis=0))<np.mean(np.std(old,axis=0))*.25

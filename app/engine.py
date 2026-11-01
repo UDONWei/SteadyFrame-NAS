@@ -220,6 +220,16 @@ def analysis_frames(source, meta, size, cancelled, start, count, reference, subj
                 yield i,frame,first_chunk and i==reference
             first_chunk=False;end=begin
 
+def render_frame(frame, transform, output_size):
+    """Cubic subpixel warp + area reduction to limit moving high-frequency aliasing."""
+    h,w=frame.shape[:2]
+    stabilized=cv2.warpAffine(frame,transform[:2],(w,h),flags=cv2.INTER_CUBIC,
+                              borderMode=cv2.BORDER_CONSTANT)
+    if output_size==(w,h):return stabilized
+    interpolation=cv2.INTER_AREA if output_size[0]<=w and output_size[1]<=h else cv2.INTER_CUBIC
+    return cv2.resize(stabilized,output_size,interpolation=interpolation)
+
+
 def stabilize(source, normalized, output, options, report, cancelled):
     # normalized retained for API compatibility; it is deliberately never opened.
     def check():
@@ -320,8 +330,7 @@ def stabilize(source, normalized, output, options, report, cancelled):
                 for i,warp in enumerate(warps):
                     check(); ok,frame=cap.read()
                     if not ok: raise ValueError('第二遍解码提前结束')
-                    stabilized=cv2.warpAffine(frame,(z@warp)[:2],(w,h),borderMode=cv2.BORDER_CONSTANT)
-                    p.stdin.write(cv2.resize(stabilized,(ow,oh)).tobytes())
+                    p.stdin.write(render_frame(frame,z@warp,(ow,oh)).tobytes())
                     if i%20==0: report('编码导出',45+54*i/len(poses))
                 p.stdin.close()
                 if p.wait()!=0: raise ValueError((output.parent/'encode.log').read_text(errors='replace')[-1500:])
@@ -329,4 +338,4 @@ def stabilize(source, normalized, output, options, report, cancelled):
                 if p.poll() is None: p.kill(); p.wait()
     finally: cap.release()
     check(); temp.replace(output)
-    return dict(**meta,output_width=ow,output_height=oh,effective_zoom=zoom,stabilization_strength=strength,auto_crop=options.get('auto_crop',True),retained_area=1/zoom**2,weak_tracking_frames=weak_total)
+    return dict(**meta,output_width=ow,output_height=oh,effective_zoom=zoom,stabilization_strength=strength,auto_crop=options.get('auto_crop',True),retained_area=1/zoom**2,weak_tracking_frames=weak_total,resampling='cubic-area')

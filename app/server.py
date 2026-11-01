@@ -165,7 +165,7 @@ def render_worker(id,options):
     except Exception as e: update(id,state='cancelled' if events[id].is_set() else 'failed',message=str(e))
 
 @app.get('/api/health')
-def health(): return {'status':'ok','version':'0.6.0'}
+def health(): return {'status':'ok','version':'0.7.0'}
 
 @app.get('/api/export-settings')
 def export_settings():
