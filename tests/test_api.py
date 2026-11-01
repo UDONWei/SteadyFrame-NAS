@@ -1,6 +1,7 @@
 import importlib
 import pytest
 import time
+import threading
 from fastapi.testclient import TestClient
 
 @pytest.fixture
@@ -45,3 +46,30 @@ def test_job_lifecycle(client):
     done=wait_for('done')
     result=client.get(f"/api/jobs/{job['id']}/{done['result']}")
     assert result.status_code==200 and len(result.content)>1000
+
+def test_first_frame_available_before_proxy_and_export_preempts(client,monkeypatch):
+    from app import server,engine
+    from test_preview import wait_job
+    source=server.MEDIA/'short.mp4'
+    engine.run(['-y','-f','lavfi','-i','testsrc2=size=320x180:rate=12:duration=1',
+                '-c:v','libx264','-threads','2',str(source)])
+    started=threading.Event();stopped=threading.Event()
+    def slow_preview(source,target,meta,cancelled,progress):
+        started.set()
+        for _ in range(200):
+            if cancelled():stopped.set();raise InterruptedError('preempted')
+            time.sleep(.02)
+        raise RuntimeError('preview should have been interrupted')
+    monkeypatch.setattr(engine,'normalize',slow_preview)
+    job=client.post('/api/prepare',json={'path':'short.mp4'}).json()
+    try:
+        assert started.wait(5)
+        j=wait_job(client,job['id'],'previewing')
+        assert j['frame_ready'] and not j.get('preview_ready')
+        assert client.get(f"/api/jobs/{j['id']}/first.jpg").status_code==200
+        assert client.get(f"/api/jobs/{j['id']}/preview.mp4").status_code==404
+        assert client.post(f"/api/jobs/{j['id']}/render",json={'mode':'translation'}).status_code==200
+        assert stopped.wait(2)
+        assert wait_job(client,j['id'],'done')['output']['output_width']==320
+    finally:
+        server.events[job['id']].set()

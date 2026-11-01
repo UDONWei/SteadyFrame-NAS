@@ -19,6 +19,7 @@ pool=ThreadPoolExecutor(max_workers=1)
 lock=threading.RLock()
 jobs={}
 events={}
+preview_stops={}
 EXT={'.mp4','.mov','.mkv','.avi','.mts','.m2ts','.webm','.m4v','.mpg','.mpeg','.ts','.wmv','.flv','.3gp'}
 
 def source(path):
@@ -53,8 +54,8 @@ def save(job):
 for state in DATA.glob('*/state.json'):
     try:
         j=json.loads(state.read_text(encoding='utf-8'))
-        if j['state'] in ('preparing','queued','running'): j.update(state='interrupted',message='服务重启，任务中断；请重新准备')
-        jobs[j['id']]=j; events[j['id']]=threading.Event()
+        if j['state'] in ('preparing','previewing','queued','running'): j.update(state='interrupted',message='服务重启，任务中断；请重新准备')
+        jobs[j['id']]=j; events[j['id']]=threading.Event(); preview_stops[j['id']]=threading.Event()
     except (ValueError,KeyError): pass
 
 def update(id,**values):
@@ -68,15 +69,25 @@ def getjob(id):
 def prepare_worker(id):
     try:
         j=getjob(id); folder=DATA/id
-        engine.normalize(source(j['path']),folder/'preview.mp4')
         if events[id].is_set(): raise InterruptedError('任务已取消')
-        meta=engine.inspect(folder/'preview.mp4')
-        cap=engine.cv2.VideoCapture(str(folder/'preview.mp4'))
-        try: ok,frame=cap.read()
-        finally: cap.release()
-        if not ok: raise ValueError('无法读取预览')
-        engine.cv2.imwrite(str(folder/'first.jpg'),frame)
-        update(id,state='ready',meta=meta,message='可选择防抖方式及主体',progress=0)
+        original=source(j['path']); meta=engine.inspect(original)
+        engine.extract_first(original,folder/'first.jpg',meta)
+        if events[id].is_set(): raise InterruptedError('任务已取消')
+        update(id,state='previewing',frame_ready=True,meta=meta,message='首帧已就绪，可选主体或直接导出；后台生成720p预览',progress=0)
+        def progress(value):
+            with lock:
+                if jobs[id]['state']=='previewing': update(id,progress=round(value,1))
+        try:
+            engine.normalize(original,folder/'preview.mp4',meta,
+                lambda: events[id].is_set() or preview_stops[id].is_set(),progress)
+            with lock:
+                update(id,preview_ready=True)
+                if jobs[id]['state']=='previewing': update(id,state='ready',message='720p预览已就绪；导出读取原片',progress=0)
+        except Exception as e:
+            with lock:
+                if events[id].is_set(): update(id,state='cancelled',message='任务已取消')
+                elif jobs[id]['state']=='previewing':
+                    update(id,state='ready',preview_error=str(e),message='播放预览未完成，仍可用首帧选主体并从原片导出',progress=0)
     except Exception as e: update(id,state='cancelled' if events[id].is_set() else 'failed',message=str(e))
 
 def render_worker(id,options):
@@ -90,7 +101,7 @@ def render_worker(id,options):
     except Exception as e: update(id,state='cancelled' if events[id].is_set() else 'failed',message=str(e))
 
 @app.get('/api/health')
-def health(): return {'status':'ok'}
+def health(): return {'status':'ok','version':'0.2.0'}
 
 @app.get('/api/files')
 def files(path: str=''):
@@ -112,21 +123,25 @@ def list_jobs():
 def prepare(body: Prepare):
     source(body.path)
     with lock:
-        if sum(j['state'] in ('preparing','queued','running') for j in jobs.values())>=4: raise HTTPException(429,'任务队列已满')
-        id=uuid.uuid4().hex; jobs[id]=dict(id=id,path=body.path,state='preparing',message='生成标准化预览',progress=0)
-        events[id]=threading.Event(); save(jobs[id]); pool.submit(prepare_worker,id)
+        if sum(j['state'] in ('preparing','previewing','queued','running') for j in jobs.values())>=4: raise HTTPException(429,'任务队列已满')
+        id=uuid.uuid4().hex; jobs[id]=dict(id=id,path=body.path,state='preparing',message='提取首帧',progress=0)
+        events[id]=threading.Event(); preview_stops[id]=threading.Event(); save(jobs[id]); pool.submit(prepare_worker,id)
         return dict(jobs[id])
 
 @app.post('/api/jobs/{id}/render')
 def render(id: str,options: Options):
     with lock:
-        if getjob(id)['state']!='ready': raise HTTPException(409,'请等待预览准备完成或新建任务')
-        update(id,state='queued',options=options.model_dump()); pool.submit(render_worker,id,options.model_dump())
+        if getjob(id)['state'] not in ('ready','previewing'): raise HTTPException(409,'请等待首帧准备完成或新建任务')
+        update(id,state='queued',message='等待原片导出',options=options.model_dump())
+        preview_stops[id].set(); pool.submit(render_worker,id,options.model_dump())
     return getjob(id)
 
 @app.post('/api/jobs/{id}/cancel')
 def cancel(id: str):
-    getjob(id); events[id].set(); return {'message':'取消已请求；预览转码将在当前步骤结束后取消'}
+    with lock:
+        j=getjob(id); events[id].set()
+        if j['state']=='ready': update(id,state='cancelled',message='任务已取消')
+    return {'message':'取消已请求'}
 
 @app.get('/api/jobs/{id}/{asset}')
 def asset(id: str,asset: str):

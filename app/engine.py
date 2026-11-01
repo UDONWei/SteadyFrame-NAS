@@ -1,6 +1,8 @@
 """Bounded-frame-memory, two-pass CPU stabilization. No source writes."""
 import os
 import subprocess
+import tempfile
+import threading
 from pathlib import Path
 import cv2
 import numpy as np
@@ -13,20 +15,103 @@ def run(args):
     if p.returncode:
         raise ValueError(p.stderr.decode(errors='replace')[-2000:])
 
-def normalize(source, target):
-    # CFR intermediate also normalizes rotation and pixel aspect before ROI selection.
-    run(['-y', '-i', str(source), '-map', '0:v:0', '-an', '-vf',
-         'scale=trunc(iw*sar/2)*2:trunc(ih/2)*2,setsar=1', '-fps_mode', 'cfr',
-         '-c:v', 'libx264', '-crf', '18', '-preset', 'fast', '-threads', '2', str(target)])
+def preview_size(meta):
+    w,h=meta['width'],meta['height']
+    scale=min(1.,1280/max(w,h),720/min(w,h))
+    return max(2,int(w*scale)//2*2),max(2,int(h*scale)//2*2)
+
+def video_filter(meta, size):
+    return f"fps={meta['fps']:.12g},scale={size[0]}:{size[1]},setsar=1"
+
+def extract_first(source, target, meta):
+    w,h=preview_size(meta)
+    run(['-y','-threads','2','-i',str(source),'-map','0:v:0','-an',
+         '-vf',f'scale={w}:{h},setsar=1','-frames:v','1','-q:v','3','-threads','2',str(target)])
+
+def normalize(source, target, meta=None, cancelled=lambda:False, progress=lambda value:None):
+    """Playback-only 720p proxy. Never used as export input."""
+    meta=meta or inspect(source)
+    temp=target.with_name('preview-building.mp4')
+    args=[FFMPEG,'-hide_banner','-loglevel','error','-nostdin','-y','-threads','2',
+          '-i',str(source),'-map','0:v:0','-map','0:a:0?',
+          '-vf',video_filter(meta,preview_size(meta)),'-c:v','libx264','-crf','25',
+          '-preset','ultrafast','-pix_fmt','yuv420p','-threads','2','-c:a','aac',
+          '-movflags','+faststart','-progress','pipe:1','-nostats',str(temp)]
+    with tempfile.TemporaryFile() as log:
+        p=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=log,text=True)
+        latest=[0]
+        def read_progress():
+            for line in p.stdout:
+                if line.startswith('frame='):
+                    try: latest[0]=int(line.split('=',1)[1])
+                    except ValueError: pass
+        reader=threading.Thread(target=read_progress,daemon=True); reader.start()
+        try:
+            while True:
+                if cancelled(): raise InterruptedError('预览已停止')
+                try: p.wait(timeout=.25); break
+                except subprocess.TimeoutExpired:
+                    progress(min(99,100*latest[0]/max(1,meta['frames'])))
+            if p.returncode:
+                log.seek(0); raise ValueError(log.read().decode(errors='replace')[-2000:])
+            if cancelled(): raise InterruptedError('预览已停止')
+            temp.replace(target); progress(100)
+        finally:
+            if p.poll() is None: p.kill(); p.wait()
+            reader.join(); p.stdout.close()
+            temp.unlink(missing_ok=True)
+
+class SourceFrames:
+    """Decode original through FFmpeg, same orientation and CFR timeline in both passes."""
+    def __init__(self, source, meta, size, cancelled):
+        self.size=size; self.cancelled=cancelled
+        self.log=tempfile.TemporaryFile()
+        self.p=subprocess.Popen([FFMPEG,'-hide_banner','-loglevel','error','-nostdin',
+            '-threads','2','-i',str(source),'-map','0:v:0','-an',
+            '-vf',video_filter(meta,size),'-pix_fmt','bgr24','-threads','2',
+            '-f','rawvideo','pipe:1'],stdout=subprocess.PIPE,stderr=self.log)
+        self.done=threading.Event()
+        def watch():
+            while not self.done.wait(.1):
+                if cancelled():
+                    if self.p.poll() is None: self.p.kill()
+                    return
+        self.watcher=threading.Thread(target=watch,daemon=True);self.watcher.start()
+    def read(self):
+        if self.cancelled(): raise InterruptedError('任务已取消')
+        w,h=self.size; expected=w*h*3; data=bytearray()
+        while len(data)<expected:
+            part=self.p.stdout.read(expected-len(data))
+            if not part: break
+            data.extend(part)
+        if self.cancelled(): raise InterruptedError('任务已取消')
+        if not data:
+            if self.p.wait()!=0:
+                self.log.seek(0);raise ValueError(self.log.read().decode(errors='replace')[-2000:])
+            return False,None
+        if len(data)!=expected: raise ValueError('原始视频解码不完整')
+        return True,np.frombuffer(data,np.uint8).reshape(h,w,3)
+    def release(self):
+        self.done.set()
+        if self.p.poll() is None: self.p.kill()
+        self.p.wait();self.watcher.join();self.p.stdout.close();self.log.close()
 
 def inspect(path):
     cap = cv2.VideoCapture(str(path))
     try:
+        cap.set(cv2.CAP_PROP_ORIENTATION_AUTO,1)
         ok, frame = cap.read()
         if not ok: raise ValueError('无法解码视频首帧')
         fps = cap.get(cv2.CAP_PROP_FPS)
         if not np.isfinite(fps) or fps <= 0: raise ValueError('无效帧率')
-        return dict(width=frame.shape[1], height=frame.shape[0], fps=fps,
+        w,h=frame.shape[1],frame.shape[0]
+        sar_den=cap.get(cv2.CAP_PROP_SAR_DEN)
+        sar=cap.get(cv2.CAP_PROP_SAR_NUM)/sar_den if sar_den else 1.
+        if not np.isfinite(sar) or sar<=0: sar=1.
+        if int(cap.get(cv2.CAP_PROP_ORIENTATION_META))%180:
+            h=round(h*sar)
+        else: w=round(w*sar)
+        return dict(width=max(2,w//2*2), height=max(2,h//2*2), fps=fps,
                     frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
     finally: cap.release()
 
@@ -40,14 +125,16 @@ def matrix(p):
     return np.array([[c, -s, x], [s, c, y], [0, 0, 1]], dtype=np.float64)
 
 def stabilize(source, normalized, output, options, report, cancelled):
+    # normalized retained for API compatibility; it is deliberately never opened.
     def check():
         if cancelled(): raise InterruptedError('任务已取消')
-    meta = inspect(normalized)
+    check()
+    meta = inspect(source)
     w, h, fps = meta['width'], meta['height'], meta['fps']
     scale = min(1., 960 / max(w, h))
     size = (max(2, round(w*scale)), max(2, round(h*scale)))
     mode = options['mode']
-    cap = cv2.VideoCapture(str(normalized))
+    cap = SourceFrames(source,meta,size,cancelled)
     poses, cumulative, tracker, start = [], np.eye(3), None, None
     previous = None
     try:
@@ -90,21 +177,22 @@ def stabilize(source, normalized, output, options, report, cancelled):
             if len(poses)%20==0: report('分析运动',len(poses)/max(1,meta['frames'])*45)
     finally: cap.release()
     if not poses: raise ValueError('空视频')
-    poses=np.asarray(poses); poses[:,2]=np.unwrap(poses[:,2]); poses[:,:2]/=scale
+    poses=np.asarray(poses); poses[:,2]=np.unwrap(poses[:,2])
     desired=np.zeros_like(poses) if mode in ('lock','subject') else smooth(poses,options['smoothing'])
     height=options['resolution']
     ow,oh=(w//2*2,h//2*2) if height==0 else (max(2,round(w/h*height/2)*2),height)
     codec=options['codec']; fmt=options['format']
-    enc={'h264':['-c:v','libx264','-crf','20','-preset','fast'],
-         'hevc':['-c:v','libx265','-crf','24','-preset','fast','-x265-params','pools=2'],
+    enc={'h264':['-c:v','libx264','-crf','18','-preset','fast'],
+         'hevc':['-c:v','libx265','-crf','20','-preset','fast','-x265-params','pools=2'],
          'vp9':['-c:v','libvpx-vp9','-crf','32','-b:v','0']}[codec]
     temp=output.with_name('render.'+fmt)
     cmd=[FFMPEG,'-hide_banner','-loglevel','error','-y','-f','rawvideo','-pix_fmt','bgr24',
          '-s',f'{ow}x{oh}','-r',str(fps),'-i','pipe:0','-i',str(source),
          '-map','0:v:0','-map','1:a:0?',*enc,'-threads','2','-pix_fmt','yuv420p',
-         '-c:a','libopus' if fmt=='webm' else 'aac','-shortest']
+         '-c:a','libopus' if fmt=='webm' else 'aac','-af','apad','-t',f'{len(poses)/fps:.12g}']
     if fmt in ('mp4','mov'): cmd+=['-movflags','+faststart']
-    cap=cv2.VideoCapture(str(normalized))
+    cap=SourceFrames(source,meta,(w,h),cancelled)
+    coordinates=np.diag([w/size[0],h/size[1],1.])
     try:
         with open(output.parent/'encode.log','wb') as log:
             p=subprocess.Popen([*cmd,str(temp)],stdin=subprocess.PIPE,stderr=log)
@@ -112,7 +200,7 @@ def stabilize(source, normalized, output, options, report, cancelled):
                 for i,(pose,target) in enumerate(zip(poses,desired)):
                     check(); ok,frame=cap.read()
                     if not ok: raise ValueError('第二遍解码提前结束')
-                    warp=matrix(target)@np.linalg.inv(matrix(pose))
+                    warp=coordinates@matrix(target)@np.linalg.inv(matrix(pose))@np.linalg.inv(coordinates)
                     zoom=options['zoom']; z=np.array([[zoom,0,(1-zoom)*w/2],[0,zoom,(1-zoom)*h/2],[0,0,1]])
                     stabilized=cv2.warpAffine(frame,(z@warp)[:2],(w,h),borderMode=cv2.BORDER_CONSTANT)
                     p.stdin.write(cv2.resize(stabilized,(ow,oh)).tobytes())
