@@ -42,6 +42,14 @@ def test_job_lifecycle(client,monkeypatch):
             time.sleep(.05)
         pytest.fail('job timed out')
     wait_for('ready')
+    check=f"/api/jobs/{job['id']}/subject-check"
+    assert client.post(check,json={'roi':[.9,.9,.5,.5]}).status_code==422
+    assert client.post(check,json={'roi':[.2,.2,.01,.01]}).status_code==400
+    assert client.post(check,json={'roi':[.2,.2,.5,.5],'reference_time':99}).status_code==400
+    checked=client.post(check,json={'roi':[.2,.2,.5,.5],'reference_time':.5})
+    assert checked.status_code==200 and checked.json()['valid']
+    saved=next(j for j in client.get('/api/jobs').json() if j['id']==job['id'])
+    assert saved['subject_selection']=={'roi':[.2,.2,.5,.5],'reference_time':.5}
     frame=client.get(f"/api/jobs/{job['id']}/frame?time=0.5")
     assert frame.status_code==200 and frame.headers['X-Preview-Cache']=='MISS'
     import subprocess

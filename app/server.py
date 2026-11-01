@@ -165,7 +165,7 @@ def render_worker(id,options):
     except Exception as e: update(id,state='cancelled' if events[id].is_set() else 'failed',message=str(e))
 
 @app.get('/api/health')
-def health(): return {'status':'ok','version':'0.5.0'}
+def health(): return {'status':'ok','version':'0.6.0'}
 
 @app.get('/api/export-settings')
 def export_settings():
@@ -247,6 +247,42 @@ def selection_frame(id: str, time: float=Query(0,ge=0,allow_inf_nan=False)):
             for old in entries[:-128]: old.unlink(missing_ok=True)
         return Response(p.stdout,media_type='image/jpeg',headers={'X-Preview-Cache':'MISS'})
     finally:frame_lock.release()
+
+class SubjectSelection(BaseModel):
+    roi: tuple[float,float,float,float]
+    reference_time: float=Field(0,ge=0,allow_inf_nan=False)
+    @model_validator(mode='after')
+    def check_box(self):
+        x,y,w,h=self.roi
+        if not (0<=x<1 and 0<=y<1 and 0<w<=1-x and 0<h<=1-y): raise ValueError('无效主体框')
+        return self
+
+@app.post('/api/jobs/{id}/subject-check')
+def check_subject(id: str, body: SubjectSelection):
+    j=getjob(id)
+    if not j.get('meta') or not unchanged(j): raise HTTPException(409,'请重新选择视频，等待参考帧就绪')
+    meta=j['meta'];index=round(body.reference_time*meta['fps'])
+    if index>=meta['frames']: raise HTTPException(400,'主体参考帧超出视频范围')
+    if not frame_lock.acquire(blocking=False): raise HTTPException(429,'正在检查预览，请稍后重试')
+    reader=None
+    try:
+        scale=min(1.,960/max(meta['width'],meta['height']))
+        size=tuple(max(2,round(meta[k]*scale)) for k in ('width','height'))
+        reader=engine.SourceFrames(source(j['path']),meta,size,lambda:False,index/meta['fps'],1)
+        ok,frame=reader.read()
+        if not ok: raise ValueError('无法解码主体参考帧')
+        box,count=engine.validate_subject(frame,body.roi)
+        tracker=engine.cv2.TrackerCSRT_create()
+        if tracker.init(frame,box) is False: raise ValueError('主体跟踪初始化失败')
+        with lock:
+            getjob(id)
+            update(id,subject_selection=body.model_dump())
+        return {'valid':True,'features':count,'reference_time':index/meta['fps'],
+                'message':'已接收选框，参考帧纹理检查通过；请确认框内是目标主体'}
+    except ValueError as e: raise HTTPException(400,str(e))
+    finally:
+        if reader:reader.release()
+        frame_lock.release()
 
 @app.post('/api/jobs/{id}/render')
 def render(id: str,options: Options):

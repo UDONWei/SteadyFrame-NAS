@@ -167,6 +167,19 @@ def plan_crop(poses, desired, size, dimensions, options, cancelled=lambda:False)
     return warps,max(requested,needed),strength
 
 
+def validate_subject(frame, roi):
+    h,w=frame.shape[:2]
+    x,y,rw,rh=roi
+    box=tuple(int(v) for v in (x*w,y*h,rw*w,rh*h))
+    if min(box[2:])<8: raise ValueError('主体框过小，请扩大选框并覆盖主体纹理')
+    gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
+    mask=np.zeros_like(gray);bx,by,bw,bh=box;mask[by:by+bh,bx:bx+bw]=255
+    features=cv2.goodFeaturesToTrack(gray,150,.01,5,mask=mask)
+    count=0 if features is None else len(features)
+    if count<6: raise ValueError('所选区域纹理不足，无法可靠跟踪；请框住主体细节或换一帧重新选择')
+    return box,count
+
+
 def subject_step(previous, current, box):
     """Subpixel displacement, rejecting background and inconsistent optical flow."""
     x,y,w,h=map(int,box); mask=np.zeros_like(previous)
@@ -228,19 +241,19 @@ def stabilize(source, normalized, output, options, report, cancelled):
     cap=analysis_frames(source,meta,size,cancelled,clip_start,count,reference,mode=='subject')
     poses, cumulative, tracker, start = [None]*count, np.eye(3), None, None
     processed=0
+    weak_tracking=0;weak_total=0
     previous = None
     try:
         for frame_index,frame,reset in cap:
             check()
-            if reset: tracker=None;previous=None
+            if reset: tracker=None;previous=None;weak_tracking=0
             small = cv2.resize(frame, size)
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
             if mode == 'subject':
                 if tracker is None:
-                    x,y,rw,rh = options['roi']
-                    box = tuple(int(v) for v in (x*size[0],y*size[1],rw*size[0],rh*size[1]))
-                    if min(box[2:]) < 8: raise ValueError('主体框过小，请增大选框')
-                    tracker = cv2.TrackerCSRT_create(); tracker.init(small, box)
+                    box,_=validate_subject(small,options['roi'])
+                    tracker = cv2.TrackerCSRT_create()
+                    if tracker.init(small,box) is False: raise ValueError('主体跟踪初始化失败，请重新框选')
                     start = np.array([box[0]+box[2]/2,box[1]+box[3]/2])
                     refined=start.copy()
                 else:
@@ -250,6 +263,9 @@ def stabilize(source, normalized, output, options, report, cancelled):
                 center = np.array([box[0]+box[2]/2,box[1]+box[3]/2])
                 if previous is not None:
                     delta=subject_step(previous,gray,previous_box)
+                    weak_tracking=weak_tracking+1 if delta is None else 0
+                    weak_total+=int(delta is None)
+                    if weak_tracking>=5: raise ValueError(f'第 {frame_index+1} 帧主体运动特征连续不可靠，已停止导出；请重新框选清晰主体或缩短片段')
                     predicted=refined+delta if delta is not None else refined
                     # Retain measured shake cancellation; slowly correct tracker drift.
                     alpha=2/(options['smoothing']+2) if delta is not None else .35
@@ -313,4 +329,4 @@ def stabilize(source, normalized, output, options, report, cancelled):
                 if p.poll() is None: p.kill(); p.wait()
     finally: cap.release()
     check(); temp.replace(output)
-    return dict(**meta,output_width=ow,output_height=oh,effective_zoom=zoom,stabilization_strength=strength,auto_crop=options.get('auto_crop',True),retained_area=1/zoom**2)
+    return dict(**meta,output_width=ow,output_height=oh,effective_zoom=zoom,stabilization_strength=strength,auto_crop=options.get('auto_crop',True),retained_area=1/zoom**2,weak_tracking_frames=weak_total)

@@ -107,3 +107,23 @@ def test_manual_zoom_and_auto_metadata(clip,tmp_path):
         resolution=0,smoothing=8,zoom=1,auto_crop=True,max_auto_zoom=2),lambda *a:None,lambda:False)
     assert 1<meta['effective_zoom']<=2 and meta['auto_crop']
     assert meta['retained_area']==pytest.approx(1/meta['effective_zoom']**2)
+
+
+def test_subject_selection_rejects_blank_and_tiny_regions():
+    blank=np.full((180,320,3),120,np.uint8)
+    with pytest.raises(ValueError,match='纹理不足'):
+        engine.validate_subject(blank,(.2,.2,.5,.5))
+    with pytest.raises(ValueError,match='主体框过小'):
+        engine.validate_subject(blank,(.2,.2,.01,.01))
+    textured=np.random.default_rng(81).integers(0,255,blank.shape,dtype=np.uint8)
+    box,count=engine.validate_subject(textured,(.2,.2,.5,.5))
+    assert box==(64,36,160,90) and count>=6
+
+
+def test_subject_stops_after_persistent_unreliable_motion(clip,tmp_path,monkeypatch):
+    monkeypatch.setattr(engine,'subject_step',lambda *a:None)
+    source,proxy=clip
+    with pytest.raises(ValueError,match='主体运动特征连续不可靠'):
+        engine.stabilize(source,proxy,tmp_path/'bad.mp4',dict(mode='subject',roi=(.2,.2,.6,.6),
+            smoothing=30,format='mp4',codec='h264',resolution=0,zoom=1.1),lambda *a:None,lambda:False)
+    assert not (tmp_path/'bad.mp4').exists()
