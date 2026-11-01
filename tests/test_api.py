@@ -162,3 +162,24 @@ def test_export_host_path_and_boundaries(client,monkeypatch,tmp_path):
     for invalid in ['/nas/elsewhere','../media','/nas/exports/../../private']:
         with pytest.raises(Exception):server.export_directory(invalid)
     assert client.get('/api/export-settings').json()['default']=='/nas/exports'
+
+
+def test_idle_health_requests_do_not_start_workers(client,monkeypatch):
+    from app import server
+    monkeypatch.setattr(server.pool,'submit',lambda *a,**k:pytest.fail('idle requests must not start workers'))
+    for _ in range(3):
+        assert client.get('/api/health').status_code==200
+        assert client.get('/api/jobs').json()==[]
+        assert client.get('/api/files').status_code==200
+    assert not list(server.DATA.glob('*/state.json'))
+
+
+def test_successful_health_logs_are_quiet_but_errors_remain(client):
+    import logging
+    from app import server
+    def record(path,status):
+        return logging.LogRecord('uvicorn.access',20,'',0,'%s %s %s %s %s',('client','GET',path,'1.1',status),None)
+    filt=server.QuietHealth()
+    assert not filt.filter(record('/api/health',200))
+    assert filt.filter(record('/api/health',500))
+    assert filt.filter(record('/api/jobs',200))

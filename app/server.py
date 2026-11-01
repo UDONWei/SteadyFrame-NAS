@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import threading
 import uuid
@@ -13,6 +14,17 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 from . import engine
+
+class QuietHealth(logging.Filter):
+    quiet_health_filter=True
+    def filter(self, record):
+        args=record.args
+        return not (isinstance(args,tuple) and len(args)>=5 and args[1]=='GET'
+                    and str(args[2]).split('?',1)[0]=='/api/health' and args[4]==200)
+
+access_logger=logging.getLogger('uvicorn.access')
+if not any(getattr(f,'quiet_health_filter',False) for f in access_logger.filters):
+    access_logger.addFilter(QuietHealth())
 
 MEDIA=Path(os.environ.get('MEDIA_ROOT','/media')).resolve()
 DATA=Path(os.environ.get('DATA_ROOT','/data')).resolve()
@@ -165,7 +177,7 @@ def render_worker(id,options):
     except Exception as e: update(id,state='cancelled' if events[id].is_set() else 'failed',message=str(e))
 
 @app.get('/api/health')
-def health(): return {'status':'ok','version':'0.7.0'}
+def health(): return {'status':'ok','version':'0.7.1'}
 
 @app.get('/api/export-settings')
 def export_settings():
