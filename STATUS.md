@@ -12,3 +12,7 @@
 
 仓库公开发布仅包含源码及合成测试，不含用户视频、NAS 私人地址、密码、数据库或运行配置。
 
+Linux 云端验收：GitHub Actions run 41312732096 全部成功，包含 pytest、Compose config、Docker build、只读根文件系统容器启动与健康检查。证据：https://github.com/UDONWei/SteadyFrame-NAS/actions/runs/41312732096 。这不是 NAS 实机验收。
+
+Codex 云端聊天迁移尚未完成：创建专属环境页面两次报无法加载 GitHub 连接；已有环境的 create_thread 请求长时间未返回任务 ID，已停止本地等待，未确认远端是否创建。下次先核查是否存在 SteadyFrame NAS 云端任务，避免重复创建。GitHub 源码、CI 与 CLOUD_HANDOFF.md 已就绪。
+
