@@ -63,12 +63,12 @@ def normalize(source, target, meta=None, cancelled=lambda:False, progress=lambda
 
 class SourceFrames:
     """Decode original through FFmpeg, same orientation and CFR timeline in both passes."""
-    def __init__(self, source, meta, size, cancelled):
+    def __init__(self, source, meta, size, cancelled, start=0, count=None):
         self.size=size; self.cancelled=cancelled
         self.log=tempfile.TemporaryFile()
         self.p=subprocess.Popen([FFMPEG,'-hide_banner','-loglevel','error','-nostdin',
-            '-threads','2','-i',str(source),'-map','0:v:0','-an',
-            '-vf',video_filter(meta,size),'-pix_fmt','bgr24','-threads','2',
+            '-threads','2','-ss',str(start),'-i',str(source),'-map','0:v:0','-an',
+            *(['-frames:v',str(count)] if count is not None else []),'-vf',video_filter(meta,size),'-pix_fmt','bgr24','-threads','2',
             '-f','rawvideo','pipe:1'],stdout=subprocess.PIPE,stderr=self.log)
         self.done=threading.Event()
         def watch():
@@ -124,6 +124,46 @@ def matrix(p):
     c, s = np.cos(angle), np.sin(angle)
     return np.array([[c, -s, x], [s, c, y], [0, 0, 1]], dtype=np.float64)
 
+def subject_step(previous, current, box):
+    """Subpixel displacement, rejecting background and inconsistent optical flow."""
+    x,y,w,h=map(int,box); mask=np.zeros_like(previous)
+    x=max(0,x);y=max(0,y);mask[y:y+h,x:x+w]=255
+    points=cv2.goodFeaturesToTrack(previous,150,.01,5,mask=mask)
+    if points is None or len(points)<6: return None
+    nxt,status,_=cv2.calcOpticalFlowPyrLK(previous,current,points,None)
+    if nxt is None: return None
+    back,reverse,_=cv2.calcOpticalFlowPyrLK(current,previous,nxt,None)
+    if back is None: return None
+    valid=(status.ravel()==1)&(reverse.ravel()==1)&(np.linalg.norm((back-points).reshape(-1,2),axis=1)<.8)
+    delta=(nxt-points).reshape(-1,2)[valid]
+    if len(delta)<6:return None
+    median=np.median(delta,axis=0)
+    good=delta[np.linalg.norm(delta-median,axis=1)<1.5]
+    return np.median(good,axis=0) if len(good)>=6 else None
+
+def analysis_frames(source, meta, size, cancelled, start, count, reference, subject):
+    def forward(first,n):
+        reader=SourceFrames(source,meta,size,cancelled,start+first/meta['fps'],n)
+        try:
+            for i in range(first,first+n):
+                ok,frame=reader.read()
+                if not ok: break
+                yield i,frame
+        finally:reader.release()
+    if not subject:
+        for i,frame in forward(0,count):yield i,frame,False
+        return
+    for i,frame in forward(reference,count-reference):yield i,frame,i==reference
+    if reference:
+        # Decode short chunks so reverse tracking never buffers a whole 4K clip.
+        end=reference+1;first_chunk=True
+        while end>0:
+            begin=max(0,end-48)
+            chunk=list(forward(begin,end-begin))
+            for i,frame in reversed(chunk):
+                yield i,frame,first_chunk and i==reference
+            first_chunk=False;end=begin
+
 def stabilize(source, normalized, output, options, report, cancelled):
     # normalized retained for API compatibility; it is deliberately never opened.
     def check():
@@ -134,14 +174,22 @@ def stabilize(source, normalized, output, options, report, cancelled):
     scale = min(1., 960 / max(w, h))
     size = (max(2, round(w*scale)), max(2, round(h*scale)))
     mode = options['mode']
-    cap = SourceFrames(source,meta,size,cancelled)
-    poses, cumulative, tracker, start = [], np.eye(3), None, None
+    clip_start=round(options.get('start',0)*fps)/fps
+    clip_end=options.get('end')
+    duration=meta['frames']/fps
+    clip_end=min(duration,clip_end) if clip_end is not None else duration
+    count=int(round((clip_end-clip_start)*fps))
+    if count<1: raise ValueError('剪辑范围至少需要一帧')
+    reference=round((options.get('reference_time',clip_start)-clip_start)*fps)
+    if mode=='subject' and not 0<=reference<count: raise ValueError('主体选择帧必须位于剪辑范围内')
+    cap=analysis_frames(source,meta,size,cancelled,clip_start,count,reference,mode=='subject')
+    poses, cumulative, tracker, start = [None]*count, np.eye(3), None, None
+    processed=0
     previous = None
     try:
-        while True:
+        for frame_index,frame,reset in cap:
             check()
-            ok, frame = cap.read()
-            if not ok: break
+            if reset: tracker=None;previous=None
             small = cv2.resize(frame, size)
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
             if mode == 'subject':
@@ -151,11 +199,19 @@ def stabilize(source, normalized, output, options, report, cancelled):
                     if min(box[2:]) < 8: raise ValueError('主体框过小，请增大选框')
                     tracker = cv2.TrackerCSRT_create(); tracker.init(small, box)
                     start = np.array([box[0]+box[2]/2,box[1]+box[3]/2])
+                    refined=start.copy()
                 else:
+                    previous_box=box
                     found, box = tracker.update(small)
-                    if not found: raise ValueError(f'第 {len(poses)} 帧主体跟踪丢失，请改选主体或缩短片段')
+                    if not found: raise ValueError(f'第 {frame_index+1} 帧主体跟踪丢失，请改选主体或缩短片段')
                 center = np.array([box[0]+box[2]/2,box[1]+box[3]/2])
-                poses.append([*(center-start),0.])
+                if previous is not None:
+                    delta=subject_step(previous,gray,previous_box)
+                    predicted=refined+delta if delta is not None else refined
+                    # Retain measured shake cancellation; slowly correct tracker drift.
+                    alpha=2/(options['smoothing']+2) if delta is not None else .35
+                    refined=predicted+alpha*(center-predicted)
+                poses[frame_index]=[*(refined-start),0.]
             else:
                 if previous is not None:
                     pts = cv2.goodFeaturesToTrack(previous, 300, .01, 15)
@@ -172,11 +228,12 @@ def stabilize(source, normalized, output, options, report, cancelled):
                         angle=np.arctan2(affine[1,0],affine[0,0])
                         delta=matrix([affine[0,2],affine[1,2],angle])
                     cumulative=delta@cumulative
-                poses.append([cumulative[0,2],cumulative[1,2],np.arctan2(cumulative[1,0],cumulative[0,0])])
+                poses[frame_index]=[cumulative[0,2],cumulative[1,2],np.arctan2(cumulative[1,0],cumulative[0,0])]
             previous=gray
-            if len(poses)%20==0: report('分析运动',len(poses)/max(1,meta['frames'])*45)
-    finally: cap.release()
-    if not poses: raise ValueError('空视频')
+            processed+=1
+            if processed%20==0: report('分析运动',min(45,processed/max(1,count)*45))
+    finally: cap.close()
+    if any(p is None for p in poses): raise ValueError('剪辑范围超出可解码的视频帧')
     poses=np.asarray(poses); poses[:,2]=np.unwrap(poses[:,2])
     desired=np.zeros_like(poses) if mode in ('lock','subject') else smooth(poses,options['smoothing'])
     height=options['resolution']
@@ -187,11 +244,11 @@ def stabilize(source, normalized, output, options, report, cancelled):
          'vp9':['-c:v','libvpx-vp9','-crf','32','-b:v','0']}[codec]
     temp=output.with_name('render.'+fmt)
     cmd=[FFMPEG,'-hide_banner','-loglevel','error','-y','-f','rawvideo','-pix_fmt','bgr24',
-         '-s',f'{ow}x{oh}','-r',str(fps),'-i','pipe:0','-i',str(source),
+         '-s',f'{ow}x{oh}','-r',str(fps),'-i','pipe:0','-ss',str(clip_start),'-i',str(source),
          '-map','0:v:0','-map','1:a:0?',*enc,'-threads','2','-pix_fmt','yuv420p',
          '-c:a','libopus' if fmt=='webm' else 'aac','-af','apad','-t',f'{len(poses)/fps:.12g}']
     if fmt in ('mp4','mov'): cmd+=['-movflags','+faststart']
-    cap=SourceFrames(source,meta,(w,h),cancelled)
+    cap=SourceFrames(source,meta,(w,h),cancelled,clip_start,count)
     coordinates=np.diag([w/size[0],h/size[1],1.])
     try:
         with open(output.parent/'encode.log','wb') as log:

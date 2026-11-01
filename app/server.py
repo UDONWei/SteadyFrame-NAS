@@ -2,10 +2,12 @@ import json
 import os
 import threading
 import uuid
+import shutil
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
@@ -35,8 +37,13 @@ class Options(BaseModel):
     format: Literal['mp4','mov','mkv','webm']='mp4'
     codec: Literal['h264','hevc','vp9']='h264'
     roi: tuple[float,float,float,float] | None=None
+    start: float=Field(0,ge=0,allow_inf_nan=False)
+    end: float | None=Field(None,gt=0,allow_inf_nan=False)
+    reference_time: float=Field(0,ge=0,allow_inf_nan=False)
     @model_validator(mode='after')
     def validate_options(self):
+        if self.end is not None and self.end<=self.start: raise ValueError('剪辑结束时间必须晚于开始时间')
+        if self.mode=='subject' and (self.reference_time<self.start or (self.end is not None and self.reference_time>=self.end)): raise ValueError('主体选择帧必须位于剪辑范围内')
         if (self.format=='webm') != (self.codec=='vp9'): raise ValueError('WebM 需配合 VP9；其他容器请选择 H.264 或 HEVC')
         if self.mode=='subject':
             if self.roi is None: raise ValueError('请点选或框选主体')
@@ -90,18 +97,23 @@ def prepare_worker(id):
                     update(id,state='ready',preview_error=str(e),message='播放预览未完成，仍可用首帧选主体并从原片导出',progress=0)
     except Exception as e: update(id,state='cancelled' if events[id].is_set() else 'failed',message=str(e))
 
+def results(j):
+    return j.get('results', [dict(file=j['result'], options=j.get('options',{}))] if j.get('result') else [])
+
 def render_worker(id,options):
     try:
         if events[id].is_set(): raise InterruptedError('任务已取消')
         update(id,state='running',message='分析运动')
-        j=getjob(id); output=DATA/id/('result.'+options['format'])
+        j=getjob(id); output=DATA/id/('result-'+uuid.uuid4().hex+'.'+options['format'])
         meta=engine.stabilize(source(j['path']),DATA/id/'preview.mp4',output,options,
             lambda message,progress:update(id,message=message,progress=round(progress,1)),events[id].is_set)
-        update(id,state='done',message='导出完成',progress=100,result=output.name,output=meta)
+        with lock:
+            versions=results(jobs[id])+[dict(file=output.name,options=options,created=datetime.now(timezone.utc).isoformat(),output=meta)]
+            update(id,state='done',message='导出完成',progress=100,result=output.name,output=meta,results=versions)
     except Exception as e: update(id,state='cancelled' if events[id].is_set() else 'failed',message=str(e))
 
 @app.get('/api/health')
-def health(): return {'status':'ok','version':'0.2.0'}
+def health(): return {'status':'ok','version':'0.3.0'}
 
 @app.get('/api/files')
 def files(path: str=''):
@@ -111,13 +123,17 @@ def files(path: str=''):
     for p in sorted(folder.iterdir(),key=lambda p:(not p.is_dir(),p.name.lower())):
         if not p.resolve().is_relative_to(MEDIA): continue
         if p.is_dir() or p.suffix.lower() in EXT:
-            result.append(dict(name=p.name,path=p.relative_to(MEDIA).as_posix(),directory=p.is_dir()))
+            relative=p.relative_to(MEDIA).as_posix()
+            with lock:
+                related=[j for j in jobs.values() if j['path']==relative]
+                status=dict(preview=any(j.get('preview_ready') for j in related),frame=any(j.get('frame_ready') for j in related),outputs=sum(len(results(j)) for j in related),active=next((j['state'] for j in related if j['state'] in ('preparing','previewing','queued','running')),None))
+            result.append(dict(name=p.name,path=relative,directory=p.is_dir(),**status))
         if len(result)>=2000: break
     return result
 
 @app.get('/api/jobs')
 def list_jobs():
-    with lock: return list(reversed([dict(j) for j in jobs.values()]))
+    with lock: return list(reversed([dict(j,results=results(j)) for j in jobs.values()]))
 
 @app.post('/api/prepare')
 def prepare(body: Prepare):
@@ -128,11 +144,34 @@ def prepare(body: Prepare):
         events[id]=threading.Event(); preview_stops[id]=threading.Event(); save(jobs[id]); pool.submit(prepare_worker,id)
         return dict(jobs[id])
 
+frame_lock=threading.Lock()
+@app.get('/api/jobs/{id}/frame')
+def selection_frame(id: str, time: float=Query(0,ge=0,allow_inf_nan=False)):
+    j=getjob(id)
+    if not j.get('meta'): raise HTTPException(409,'请等待视频信息读取完成')
+    meta=j['meta']
+    if time>=meta['frames']/meta['fps']: raise HTTPException(400,'时间超出视频范围')
+    if not frame_lock.acquire(blocking=False): raise HTTPException(429,'正在提取选帧，请稍后重试')
+    try:
+        w,h=engine.preview_size(meta)
+        # JPEG returned directly: no temporary selection files to race with deletion.
+        import subprocess
+        p=subprocess.run([engine.FFMPEG,'-hide_banner','-loglevel','error','-nostdin',
+            '-threads','2','-ss',str(round(time*meta['fps'])/meta['fps']),'-i',str(source(j['path'])),
+            '-vf',f'scale={w}:{h},setsar=1','-frames:v','1','-threads','2','-f','image2pipe','-vcodec','mjpeg','pipe:1'],capture_output=True,timeout=30)
+        if p.returncode or not p.stdout: raise HTTPException(400,'无法提取此帧')
+        return Response(p.stdout,media_type='image/jpeg')
+    finally:frame_lock.release()
+
 @app.post('/api/jobs/{id}/render')
 def render(id: str,options: Options):
     with lock:
-        if getjob(id)['state'] not in ('ready','previewing'): raise HTTPException(409,'请等待首帧准备完成或新建任务')
-        update(id,state='queued',message='等待原片导出',options=options.model_dump())
+        j=getjob(id)
+        if j['state'] not in ('ready','previewing','done','failed','cancelled','interrupted') or not (DATA/id/'first.jpg').is_file(): raise HTTPException(409,'请等待首帧准备完成及当前导出结束')
+        if sum(x['state'] in ('preparing','previewing','queued','running') for x in jobs.values())>=4 and j['state']!='previewing': raise HTTPException(429,'任务队列已满')
+        if j.get('meta') and options.start>=j['meta']['frames']/j['meta']['fps']: raise HTTPException(400,'剪辑起点超出视频范围')
+        events[id].clear()
+        update(id,state='queued',progress=0,message='等待原片导出',options=options.model_dump())
         preview_stops[id].set(); pool.submit(render_worker,id,options.model_dump())
     return getjob(id)
 
@@ -143,12 +182,28 @@ def cancel(id: str):
         if j['state']=='ready': update(id,state='cancelled',message='任务已取消')
     return {'message':'取消已请求'}
 
+class DeleteRequest(BaseModel):
+    confirmed: bool=False
+
+@app.post('/api/jobs/{id}/delete')
+def delete_job(id: str, body: DeleteRequest):
+    if not body.confirmed: raise HTTPException(400,'请确认删除任务及其全部生成文件')
+    with lock:
+        j=getjob(id)
+        if j['state'] in ('preparing','previewing','queued','running'): raise HTTPException(409,'请等待任务停止后删除')
+        directory=(DATA/id).resolve()
+        if directory.parent!=DATA: raise HTTPException(400,'无效任务路径')
+        shutil.rmtree(directory)
+        del jobs[id]; events.pop(id,None); preview_stops.pop(id,None)
+    return {'deleted':True}
+
 @app.get('/api/jobs/{id}/{asset}')
 def asset(id: str,asset: str):
     j=getjob(id)
-    if asset not in ('first.jpg','preview.mp4',j.get('result')): raise HTTPException(404)
+    if asset not in ['first.jpg','preview.mp4']+[r['file'] for r in results(j)]: raise HTTPException(404)
     p=DATA/id/asset
     if not p.is_file(): raise HTTPException(404)
-    return FileResponse(p,filename=p.name if asset.startswith('result.') else None)
+    return FileResponse(p,filename=p.name if asset.startswith('result') else None)
 
 app.mount('/',StaticFiles(directory=Path(__file__).parent/'web',html=True),name='web')
+
