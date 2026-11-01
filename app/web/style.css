@@ -4,3 +4,5 @@ main>section{min-width:0}.grid>*{min-width:0}select,input{width:100%;box-sizing:
 #jobs{max-height:360px;overflow-y:auto;scrollbar-gutter:stable} .job{padding:7px 4px;line-height:1.35;font-size:13px}.job button{padding:4px 8px;margin:4px}.job a{margin:4px 8px}.job progress{height:5px;margin:5px 0}.versions{max-width:440px;padding:4px;margin:4px 0}#files{max-height:70vh;overflow-y:auto}#files button{font-size:13px;padding:7px;line-height:1.4}
 
 .timeline{display:grid;grid-template-columns:1fr 110px auto;gap:8px;align-items:end;margin-bottom:12px}.timeline p{grid-column:1/-1;margin:0;font-size:13px}@media(max-width:650px){.timeline{grid-template-columns:1fr}.timeline p{grid-column:auto}}
+
+.saved-path{font-size:12px;color:#a5b8c0;overflow-wrap:anywhere}#exportHelp{font-size:12px}

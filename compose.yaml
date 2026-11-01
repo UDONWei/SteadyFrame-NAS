@@ -11,6 +11,10 @@ services:
     volumes:
       - "${VIDEO_DIR:?Set VIDEO_DIR in .env}:/media:ro"
       - "./data:/data"
+      - "${OUTPUT_DIR:-./exports}:/exports"
+    environment:
+      OUTPUT_ROOT: /exports
+      OUTPUT_HOST_ROOT: "${OUTPUT_DIR:-/exports}"
     read_only: true
     tmpfs:
       - /tmp:size=256m

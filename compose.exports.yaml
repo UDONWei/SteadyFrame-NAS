@@ -1,0 +1,7 @@
+services:
+  steadyframe:
+    volumes:
+      - "${OUTPUT_DIR:?Set OUTPUT_DIR in .env}:/exports"
+    environment:
+      OUTPUT_ROOT: /exports
+      OUTPUT_HOST_ROOT: "${OUTPUT_DIR}"

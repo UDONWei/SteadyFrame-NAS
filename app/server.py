@@ -3,6 +3,7 @@ import os
 import threading
 import uuid
 import shutil
+import tempfile
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -16,6 +17,9 @@ from . import engine
 MEDIA=Path(os.environ.get('MEDIA_ROOT','/media')).resolve()
 DATA=Path(os.environ.get('DATA_ROOT','/data')).resolve()
 DATA.mkdir(parents=True,exist_ok=True)
+OUTPUT=Path(os.environ.get('OUTPUT_ROOT',str(DATA/'exports'))).resolve()
+OUTPUT_HOST=os.environ.get('OUTPUT_HOST_ROOT',str(OUTPUT)).replace('\\','/').rstrip('/')
+ACTIVE=('preparing','previewing','queued','running')
 app=FastAPI(title='SteadyFrame NAS')
 pool=ThreadPoolExecutor(max_workers=1)
 lock=threading.RLock()
@@ -29,7 +33,30 @@ def source(path):
     if not p.is_relative_to(MEDIA) or not p.is_file(): raise HTTPException(400,'无效媒体路径')
     return p
 
+def fingerprint(path):
+    p=source(path); st=p.stat()
+    return dict(path=str(p),size=st.st_size,mtime=st.st_mtime_ns,version=1)
+
+def unchanged(j):
+    return j.get('fingerprint')==fingerprint(j['path'])
+
+def export_directory(value):
+    value=value.strip().replace('\\','/')
+    if value==OUTPUT_HOST: value=''
+    elif value.startswith(OUTPUT_HOST+'/'): value=value[len(OUTPUT_HOST)+1:]
+    p=(OUTPUT/value).resolve()
+    if not p.is_relative_to(OUTPUT) or p.is_relative_to(MEDIA) or MEDIA.is_relative_to(p):
+        raise HTTPException(400,'导出目录必须位于已挂载的输出目录内，不能写入原视频目录')
+    return p
+
+def export_file(r):
+    if r.get('export_root')!=OUTPUT_HOST: raise HTTPException(409,'此结果位于原输出根目录，请恢复对应的输出目录挂载后访问')
+    p=export_directory(r['export_relative'])
+    if p==OUTPUT: raise HTTPException(400,'无效导出文件')
+    return p
+
 class Options(BaseModel):
+    export_directory: str=Field('',max_length=2048)
     mode: Literal['translation','smooth','lock','subject']='smooth'
     smoothing: int=Field(30,ge=1,le=150)
     zoom: float=Field(1.1,ge=1,le=2)
@@ -77,9 +104,12 @@ def prepare_worker(id):
     try:
         j=getjob(id); folder=DATA/id
         if events[id].is_set(): raise InterruptedError('任务已取消')
-        original=source(j['path']); meta=engine.inspect(original)
-        engine.extract_first(original,folder/'first.jpg',meta)
+        original=source(j['path'])
+        if not unchanged(j): raise ValueError('原视频已改变，请重新选择视频')
+        meta=j.get('meta') or engine.inspect(original)
+        if not (folder/'first.jpg').is_file(): engine.extract_first(original,folder/'first.jpg',meta)
         if events[id].is_set(): raise InterruptedError('任务已取消')
+        if not unchanged(j): raise ValueError('原视频已改变，请重新选择视频')
         update(id,state='previewing',frame_ready=True,meta=meta,message='首帧已就绪，可选主体或直接导出；后台生成720p预览',progress=0)
         def progress(value):
             with lock:
@@ -88,6 +118,7 @@ def prepare_worker(id):
             engine.normalize(original,folder/'preview.mp4',meta,
                 lambda: events[id].is_set() or preview_stops[id].is_set(),progress)
             with lock:
+                if not unchanged(j): raise ValueError('原视频已改变，请重新选择视频')
                 update(id,preview_ready=True)
                 if jobs[id]['state']=='previewing': update(id,state='ready',message='720p预览已就绪；导出读取原片',progress=0)
         except Exception as e:
@@ -104,16 +135,39 @@ def render_worker(id,options):
     try:
         if events[id].is_set(): raise InterruptedError('任务已取消')
         update(id,state='running',message='分析运动')
-        j=getjob(id); output=DATA/id/('result-'+uuid.uuid4().hex+'.'+options['format'])
+        j=getjob(id)
+        if not unchanged(j): raise ValueError('原视频已改变，请重新选择视频')
+        output=DATA/id/('result-'+uuid.uuid4().hex+'.'+options['format'])
         meta=engine.stabilize(source(j['path']),DATA/id/'preview.mp4',output,options,
             lambda message,progress:update(id,message=message,progress=round(progress,1)),events[id].is_set)
+        if not unchanged(j): raise ValueError('原视频已改变，未发布导出结果')
+        destination=export_directory(options.get('export_directory',''))
+        destination.mkdir(parents=True,exist_ok=True)
+        name=source(j['path']).stem.encode('utf-8')[:120].decode('utf-8',errors='ignore')+'-steady-'+uuid.uuid4().hex+'.'+options['format']
+        final=destination/name
+        temporary=destination/(name+'.partial')
+        try:
+            update(id,message='保存到NAS输出目录',progress=99)
+            with output.open('rb') as src,temporary.open('wb') as dst:
+                while chunk:=src.read(8*1024*1024):
+                    if events[id].is_set(): raise InterruptedError('任务已取消')
+                    dst.write(chunk)
+            if events[id].is_set(): raise InterruptedError('任务已取消')
+            temporary.replace(final)
+        finally: temporary.unlink(missing_ok=True)
+        relative=final.relative_to(OUTPUT).as_posix()
+        output.unlink(missing_ok=True)
         with lock:
-            versions=results(jobs[id])+[dict(file=output.name,options=options,created=datetime.now(timezone.utc).isoformat(),output=meta)]
+            versions=results(jobs[id])+[dict(export_relative=relative,export_root=OUTPUT_HOST,saved_path=OUTPUT_HOST+'/'+relative,file=output.name,options=options,created=datetime.now(timezone.utc).isoformat(),output=meta)]
             update(id,state='done',message='导出完成',progress=100,result=output.name,output=meta,results=versions)
     except Exception as e: update(id,state='cancelled' if events[id].is_set() else 'failed',message=str(e))
 
 @app.get('/api/health')
-def health(): return {'status':'ok','version':'0.3.0'}
+def health(): return {'status':'ok','version':'0.4.0'}
+
+@app.get('/api/export-settings')
+def export_settings():
+    return {'root':OUTPUT_HOST,'default':OUTPUT_HOST,'description':'可填写此输出根目录下的完整路径或子文件夹名；其他磁盘目录需先修改 OUTPUT_DIR 挂载。'}
 
 @app.get('/api/files')
 def files(path: str=''):
@@ -126,7 +180,9 @@ def files(path: str=''):
             relative=p.relative_to(MEDIA).as_posix()
             with lock:
                 related=[j for j in jobs.values() if j['path']==relative]
-                status=dict(preview=any(j.get('preview_ready') for j in related),frame=any(j.get('frame_ready') for j in related),outputs=sum(len(results(j)) for j in related),active=next((j['state'] for j in related if j['state'] in ('preparing','previewing','queued','running')),None))
+                signature=fingerprint(relative) if p.is_file() else None
+                valid=[j for j in related if j.get('fingerprint')==signature]
+                status=dict(preview=any(j.get('preview_ready') and (DATA/j['id']/'preview.mp4').is_file() for j in valid),frame=any(j.get('frame_ready') and (DATA/j['id']/'first.jpg').is_file() for j in valid),outputs=sum(len(results(j)) for j in related),active=next((j['state'] for j in related if j['state'] in ('preparing','previewing','queued','running')),None))
             result.append(dict(name=p.name,path=relative,directory=p.is_dir(),**status))
         if len(result)>=2000: break
     return result
@@ -137,10 +193,23 @@ def list_jobs():
 
 @app.post('/api/prepare')
 def prepare(body: Prepare):
-    source(body.path)
+    signature=fingerprint(body.path)
     with lock:
+        for j in reversed(list(jobs.values())):
+            if j['path']!=body.path or j.get('fingerprint')!=signature: continue
+            folder=DATA/j['id']
+            if j['state'] in ACTIVE: return dict(j,cache_hit=True)
+            if not (folder/'first.jpg').is_file(): continue
+            if (folder/'preview.mp4').is_file():
+                update(j['id'],frame_ready=True,preview_ready=True)
+                return dict(j,cache_hit=True)
+            if sum(x['state'] in ACTIVE for x in jobs.values())>=4: return dict(j,cache_hit=True)
+            events[j['id']].clear();preview_stops[j['id']].clear()
+            update(j['id'],state='preparing',preview_ready=False,message='复用首帧，补充720p播放预览',progress=0)
+            pool.submit(prepare_worker,j['id'])
+            return dict(j,cache_hit=True)
         if sum(j['state'] in ('preparing','previewing','queued','running') for j in jobs.values())>=4: raise HTTPException(429,'任务队列已满')
-        id=uuid.uuid4().hex; jobs[id]=dict(id=id,path=body.path,state='preparing',message='提取首帧',progress=0)
+        id=uuid.uuid4().hex; jobs[id]=dict(id=id,path=body.path,fingerprint=signature,state='preparing',message='提取首帧',progress=0)
         events[id]=threading.Event(); preview_stops[id]=threading.Event(); save(jobs[id]); pool.submit(prepare_worker,id)
         return dict(jobs[id])
 
@@ -149,18 +218,32 @@ frame_lock=threading.Lock()
 def selection_frame(id: str, time: float=Query(0,ge=0,allow_inf_nan=False)):
     j=getjob(id)
     if not j.get('meta'): raise HTTPException(409,'请等待视频信息读取完成')
+    if not unchanged(j): raise HTTPException(409,'原视频已改变，请重新选择视频')
     meta=j['meta']
-    if time>=meta['frames']/meta['fps']: raise HTTPException(400,'时间超出视频范围')
+    frame_index=round(time*meta['fps'])
+    cached=DATA/id/'frames'/f'{frame_index}.jpg'
+    if time>=meta['frames']/meta['fps'] or frame_index>=meta['frames']: raise HTTPException(400,'时间超出视频范围')
     if not frame_lock.acquire(blocking=False): raise HTTPException(429,'正在提取选帧，请稍后重试')
     try:
+        if cached.is_file():
+            cached.touch()
+            return Response(cached.read_bytes(),media_type='image/jpeg',headers={'X-Preview-Cache':'HIT'})
+        if frame_index==0 and (DATA/id/'first.jpg').is_file():
+            return Response((DATA/id/'first.jpg').read_bytes(),media_type='image/jpeg',headers={'X-Preview-Cache':'HIT'})
         w,h=engine.preview_size(meta)
-        # JPEG returned directly: no temporary selection files to race with deletion.
         import subprocess
         p=subprocess.run([engine.FFMPEG,'-hide_banner','-loglevel','error','-nostdin',
             '-threads','2','-ss',str(round(time*meta['fps'])/meta['fps']),'-i',str(source(j['path'])),
             '-vf',f'scale={w}:{h},setsar=1','-frames:v','1','-threads','2','-f','image2pipe','-vcodec','mjpeg','pipe:1'],capture_output=True,timeout=30)
         if p.returncode or not p.stdout: raise HTTPException(400,'无法提取此帧')
-        return Response(p.stdout,media_type='image/jpeg')
+        with lock:
+            getjob(id)
+            if not unchanged(j): raise HTTPException(409,'原视频已改变，请重新选择视频')
+            cached.parent.mkdir(exist_ok=True)
+            temp=cached.with_suffix('.tmp');temp.write_bytes(p.stdout);temp.replace(cached)
+            entries=sorted(cached.parent.glob('*.jpg'),key=lambda x:x.stat().st_mtime_ns)
+            for old in entries[:-128]: old.unlink(missing_ok=True)
+        return Response(p.stdout,media_type='image/jpeg',headers={'X-Preview-Cache':'MISS'})
     finally:frame_lock.release()
 
 @app.post('/api/jobs/{id}/render')
@@ -170,6 +253,12 @@ def render(id: str,options: Options):
         if j['state'] not in ('ready','previewing','done','failed','cancelled','interrupted') or not (DATA/id/'first.jpg').is_file(): raise HTTPException(409,'请等待首帧准备完成及当前导出结束')
         if sum(x['state'] in ('preparing','previewing','queued','running') for x in jobs.values())>=4 and j['state']!='previewing': raise HTTPException(429,'任务队列已满')
         if j.get('meta') and options.start>=j['meta']['frames']/j['meta']['fps']: raise HTTPException(400,'剪辑起点超出视频范围')
+        if not unchanged(j): raise HTTPException(409,'原视频已改变，请重新选择视频以更新缓存')
+        destination=export_directory(options.export_directory)
+        try:
+            destination.mkdir(parents=True,exist_ok=True)
+            with tempfile.TemporaryFile(dir=destination): pass
+        except OSError: raise HTTPException(400,'输出目录无法写入，请检查NAS目录权限和挂载')
         events[id].clear()
         update(id,state='queued',progress=0,message='等待原片导出',options=options.model_dump())
         preview_stops[id].set(); pool.submit(render_worker,id,options.model_dump())
@@ -193,6 +282,9 @@ def delete_job(id: str, body: DeleteRequest):
         if j['state'] in ('preparing','previewing','queued','running'): raise HTTPException(409,'请等待任务停止后删除')
         directory=(DATA/id).resolve()
         if directory.parent!=DATA: raise HTTPException(400,'无效任务路径')
+        if frame_lock.locked(): raise HTTPException(409,'正在提取预览帧，请稍后删除')
+        for r in results(j):
+            if r.get('export_relative'): export_file(r).unlink(missing_ok=True)
         shutil.rmtree(directory)
         del jobs[id]; events.pop(id,None); preview_stops.pop(id,None)
     return {'deleted':True}
@@ -201,9 +293,10 @@ def delete_job(id: str, body: DeleteRequest):
 def asset(id: str,asset: str):
     j=getjob(id)
     if asset not in ['first.jpg','preview.mp4']+[r['file'] for r in results(j)]: raise HTTPException(404)
-    p=DATA/id/asset
+    r=next((r for r in results(j) if r['file']==asset),None)
+    p=export_file(r) if r and r.get('export_relative') else DATA/id/asset
+    if asset in ('first.jpg','preview.mp4') and not unchanged(j): raise HTTPException(409,'原视频已改变，请重新选择视频')
     if not p.is_file(): raise HTTPException(404)
     return FileResponse(p,filename=p.name if asset.startswith('result') else None)
 
 app.mount('/',StaticFiles(directory=Path(__file__).parent/'web',html=True),name='web')
-
